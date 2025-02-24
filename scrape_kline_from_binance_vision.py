@@ -6,7 +6,7 @@ import logging
 from typing import List, Optional
 import zipfile
 import io
-from tqdm.asyncio import tqdm
+from tqdm.asyncio import tqdm_asyncio  # Changed import name
 from tqdm import tqdm as tqdm_sync
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
@@ -29,16 +29,25 @@ class BinanceVisionDownloader:
         mongo_uri = f"mongodb+srv://{os.getenv('MONGO_USER')}:{os.getenv('MONGO_PASSWORD')}@{os.getenv('MONGO_HOST')}/{os.getenv('MONGO_NAME')}?tls=true&authSource=admin&replicaSet=db-mongodb-sgp1-43703"
         self.mongo_client = AsyncIOMotorClient(mongo_uri)
         self.db = self.mongo_client[os.getenv('MONGO_NAME')]
-        self.collection = self.db[f"{symbol.lower()}_{interval}_klines"]
+        self.collection = f"{symbol.lower()}_{interval}_klines"
 
         # Setup logging
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
 
-    async def setup_mongo_indexes(self):
-        """Setup MongoDB indexes"""
-        await self.collection.create_index([("timestamp", 1)], unique=True)
-        await self.collection.create_index([("symbol", 1), ("timestamp", 1)])
+    async def setup_timeseries_collection(self):
+        """設置時間序列集合和索引"""
+        collections = await self.db.list_collection_names()
+
+        if self.collection not in collections:
+            # 創建時間序列集合
+            await self.db.create_collection(self.collection,
+                                            timeseries={
+                                                'timeField': 'open_time',  # 時間欄位
+                                                'metaField': 'metadata',  # 元數據欄位
+                                                'granularity': 'seconds'  # 粒度
+                                            }
+                                            )
 
     def _get_dates_list(self) -> List[datetime]:
         """Generate list of dates between start and end date"""
@@ -55,7 +64,7 @@ class BinanceVisionDownloader:
         filename = f"{self.symbol}-{self.interval}-{date_str}.zip"
         return f"{self.base_url}/{self.symbol}/{self.interval}/{filename}"
 
-    async def _download_file(self, url: str, date: datetime, pbar: Optional[tqdm] = None) -> Optional[List[dict]]:
+    async def _download_file(self, url: str, date: datetime, pbar: Optional[tqdm_sync] = None) -> Optional[List[dict]]:
         """Download and process single file"""
         try:
             async with self.session.get(url) as response:
@@ -78,32 +87,24 @@ class BinanceVisionDownloader:
                     csv_filename = zf.namelist()[0]
                     with zf.open(csv_filename) as csv_file:
                         # Read CSV content
-                        df = pd.read_csv(csv_file, header=None, names=[
-                            'timestamp', 'open', 'high', 'low', 'close',
-                            'volume', 'close_time', 'quote_volume', 'trades',
+                        df = pd.read_csv(csv_file, header=None, skiprows=1, names=[
+                            'open_time', 'open', 'high', 'low', 'close',
+                            'volume', 'close_time', 'quote_volume', 'count',
                             'taker_buy_volume', 'taker_buy_quote_volume', 'ignore'
                         ])
 
-                        # Convert to MongoDB documents
-                        records = []
-                        for _, row in df.iterrows():
-                            record = {
+                        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+                        df['close_time'] = pd.to_datetime(df['close_time'], unit='ms')
+                        df['metadata'] = df.apply(
+                            lambda row: {
                                 'symbol': self.symbol,
-                                'interval': self.interval,
-                                'timestamp': datetime.fromtimestamp(row['timestamp'] / 1000),
-                                'open': float(row['open']),
-                                'high': float(row['high']),
-                                'low': float(row['low']),
-                                'close': float(row['close']),
-                                'volume': float(row['volume']),
-                                'close_time': datetime.fromtimestamp(row['close_time'] / 1000),
-                                'quote_volume': float(row['quote_volume']),
-                                'trades': int(row['trades']),
-                                'taker_buy_volume': float(row['taker_buy_volume']),
-                                'taker_buy_quote_volume': float(row['taker_buy_quote_volume'])
-                            }
-                            records.append(record)
+                                'interval': self.interval
+                            },
+                            axis=1
+                        )
 
+                        records = df.to_dict(orient='records')
+                        # Convert to MongoDB documents
                         if pbar:
                             pbar.update(1)
                         return records
@@ -114,51 +115,39 @@ class BinanceVisionDownloader:
                 pbar.update(1)
             return None
 
-    async def _process_batch(self, dates: List[datetime], overall_pbar: tqdm) -> int:
+    async def _process_batch(self, dates: List[datetime], overall_pbar: tqdm_sync) -> int:
         """Download and save a batch of files"""
         total_records = 0
 
-        # Create progress bar for this batch
-        async with tqdm(
-                total=len(dates),
-                desc=f"Batch {dates[0].strftime('%Y-%m-%d')}",
-                leave=False
-        ) as batch_pbar:
-            for date in dates:
-                url = self._get_file_url(date)
-                records = await self._download_file(url, date, batch_pbar)
+        # Create a regular batch progress bar, not an async context manager
+        batch_pbar = tqdm_sync(
+            total=len(dates),
+            desc=f"Batch {dates[0].strftime('%Y-%m-%d')}",
+            leave=False
+        )
 
-                if records:
-                    try:
-                        # Use bulk write operations
-                        operations = [
-                            {
-                                'replaceOne': {
-                                    'filter': {
-                                        'symbol': record['symbol'],
-                                        'timestamp': record['timestamp']
-                                    },
-                                    'replacement': record,
-                                    'upsert': True
-                                }
-                            }
-                            for record in records
-                        ]
+        for date in dates:
+            url = self._get_file_url(date)
+            records = await self._download_file(url, date, batch_pbar)
 
-                        result = await self.collection.bulk_write(operations)
-                        total_records += len(records)
-                        self.logger.debug(f"Saved {len(records)} records for {date}")
+            if records:
+                try:
 
-                    except Exception as e:
-                        self.logger.error(f"Error saving to MongoDB: {e}")
+                    result = await self.db[self.collection].insert_many(records)
+                    total_records += len(records)
+                    self.logger.debug(f"Saved {len(records)} records for {date}")
 
-            overall_pbar.update(len(dates))
+                except Exception as e:
+                    self.logger.error(f"Error saving to MongoDB: {e}")
 
+            overall_pbar.update(1)
+
+        batch_pbar.close()
         return total_records
 
     async def download_and_save(self) -> int:
         """Main method to download and save data"""
-        await self.setup_mongo_indexes()
+        await self.setup_timeseries_collection()
         all_dates = self._get_dates_list()
         total_records = 0
 
@@ -202,7 +191,7 @@ async def main():
         start_date="2024-01-01",
         end_date="2024-01-10",
         interval="1m",
-        batch_size=20
+        batch_size=10  # Reduced batch size for demonstration
     )
 
     try:
